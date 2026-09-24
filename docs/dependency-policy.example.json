@@ -1,0 +1,9 @@
+{
+  "trustedSources": [
+    "github.com/apple",
+    "github.com/swiftlang",
+    "github.com/pointfreeco"
+  ],
+  "revisionPinAllowList": [],
+  "blockRevisionPins": false
+}
