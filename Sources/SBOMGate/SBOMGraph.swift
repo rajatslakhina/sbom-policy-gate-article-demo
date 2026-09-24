@@ -23,6 +23,9 @@ public struct SBOMGraph: Sendable {
     public let rootVersion: PackageVersion?
     public let packages: [String: Package]
     public let productRefs: Set<String>
+    /// Products whose component has `scope: "test"` (SE-0509: all of the
+    /// product's modules are test modules). They never count as shipping.
+    public let testProductRefs: Set<String>
     public let edges: [String: [String]]
 
     public init(_ doc: CycloneDXDocument) {
@@ -35,9 +38,11 @@ public struct SBOMGraph: Sendable {
 
         var packages: [String: Package] = [:]
         var products: Set<String> = []
+        var testProducts: Set<String> = []
         for component in doc.components {
             if SBOMGraph.isProductRef(component) {
                 products.insert(component.bomRef)
+                if component.scope == "test" { testProducts.insert(component.bomRef) }
                 continue
             }
             packages[component.bomRef] = Package(
@@ -50,6 +55,7 @@ public struct SBOMGraph: Sendable {
         }
         self.packages = packages
         self.productRefs = products
+        self.testProductRefs = testProducts
 
         var edges: [String: [String]] = [:]
         for dep in doc.dependencies {
@@ -69,8 +75,22 @@ public struct SBOMGraph: Sendable {
         return String(ref[..<colon])
     }
 
-    /// The root package's own products, sorted for deterministic output.
+    /// Products that don't belong to the root package.
+    public var dependencyProductRefs: Set<String> {
+        guard let root = rootIdentity else { return productRefs }
+        return productRefs.filter { SBOMGraph.packageIdentity(ofProduct: $0) != root }
+    }
+
+    /// The root package's own shipping products, sorted for deterministic
+    /// output. A root test product (`scope: "test"`, e.g. `<Name>PackageTests`)
+    /// is excluded: a test helper reached only from tests doesn't ship.
+    /// A root product named only in `dependencies`, with no component and so
+    /// no scope, is assumed to ship.
     public var rootProducts: [String] {
+        rootProductsIncludingTests.filter { !testProductRefs.contains($0) }
+    }
+
+    var rootProductsIncludingTests: [String] {
         guard let root = rootIdentity else { return [] }
         var refs = Set(productRefs.filter { SBOMGraph.packageIdentity(ofProduct: $0) == root })
         // Products the root lists as dependencies but that were not emitted as

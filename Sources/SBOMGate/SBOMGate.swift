@@ -23,6 +23,9 @@ public struct Finding: Equatable, Sendable, Identifiable {
         /// Same package identity, different repository. SwiftPM derives the
         /// identity from the last path component, so a fork keeps the name.
         case sourceMoved = "SOURCE_MOVED"
+        /// One side records where a package came from and the other doesn't,
+        /// so `SOURCE_MOVED` can't be checked. Asks a human instead of passing.
+        case sourceUnknown = "SOURCE_UNKNOWN"
         /// A newly added package from outside `trustedSources`.
         case untrustedSource = "UNTRUSTED_SOURCE"
         /// A dependency pinned to a commit or branch instead of a tag.
@@ -93,6 +96,11 @@ public enum SBOMGateError: Error, Equatable, CustomStringConvertible {
     /// not two dependency graphs. Regenerate both with the same toolchain.
     case specVersionMismatch(base: String, head: String)
     case missingRoot
+    /// Base and head describe different root packages; any diff would be noise.
+    case rootMismatch(base: String, head: String)
+    /// Generated with `--sbom-filter product` (no packages) or `package`
+    /// (no products), so the gate would pass things it can't see.
+    case filteredSBOM(side: String)
 
     public var description: String {
         switch self {
@@ -100,6 +108,10 @@ public enum SBOMGateError: Error, Equatable, CustomStringConvertible {
             return "Base SBOM is CycloneDX \(base), head is \(head). Regenerate both with the same toolchain."
         case .missingRoot:
             return "SBOM has no metadata.component, so there is no root to trace product paths from."
+        case let .rootMismatch(base, head):
+            return "Base SBOM describes '\(base)', head describes '\(head)'. Compare SBOMs of the same package."
+        case let .filteredSBOM(side):
+            return "The \(side) SBOM has no package or no product components. Generate both with the default --sbom-filter all."
         }
     }
 }
@@ -117,7 +129,19 @@ public enum SBOMGate {
         }
         let old = SBOMGraph(base)
         let new = SBOMGraph(head)
-        guard new.rootIdentity != nil else { throw SBOMGateError.missingRoot }
+        guard let baseRoot = old.rootIdentity, let headRoot = new.rootIdentity else {
+            throw SBOMGateError.missingRoot
+        }
+        guard baseRoot == headRoot else {
+            throw SBOMGateError.rootMismatch(base: baseRoot, head: headRoot)
+        }
+        // `--sbom-filter package` keeps packages but drops products;
+        // `--sbom-filter product` does the reverse. A package with no
+        // dependencies at all has neither, and is a valid SBOM.
+        for (side, graph) in [("base", old), ("head", new)]
+        where graph.packages.isEmpty != graph.dependencyProductRefs.isEmpty {
+            throw SBOMGateError.filteredSBOM(side: side)
+        }
 
         var findings: [Finding] = []
 
@@ -221,6 +245,11 @@ public enum SBOMGate {
                 rule: .sourceMoved, severity: .block, package: id,
                 message: "Same identity, different repository: \(s1) → \(s2). SwiftPM names a package by its last path component, so a fork keeps the name.",
                 path: path))
+        } else if (before.source == nil) != (after.source == nil) {
+            out.append(Finding(
+                rule: .sourceUnknown, severity: .review, package: id,
+                message: "Only one side records where this package came from (\(before.source?.description ?? "none") → \(after.source?.description ?? "none")), so a repository change can't be ruled out.",
+                path: path))
         }
 
         if let v1 = before.version, let v2 = after.version {
@@ -255,9 +284,11 @@ public enum SBOMGate {
         }
 
         if oldGraph.shippingPath(to: id) == nil, let path {
+            let unchanged = before.rawVersion == after.rawVersion && before.source == after.source
             out.append(Finding(
                 rule: .newlyShipped, severity: .review, package: id,
-                message: "Already in the graph, but now linked by a product you ship. No pin changed.",
+                message: "Already in the graph, but now linked by a product you ship."
+                    + (unchanged ? " No pin changed." : ""),
                 path: path))
         }
         return out

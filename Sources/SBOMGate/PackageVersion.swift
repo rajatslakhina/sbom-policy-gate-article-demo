@@ -18,7 +18,9 @@ public enum PackageVersion: Equatable, Sendable, CustomStringConvertible {
             self = .revision(sha: text.lowercased(), modified: modified)
             return
         }
-        let cleaned = text.hasPrefix("v") ? String(text.dropFirst()) : text
+        var cleaned = text.hasPrefix("v") ? String(text.dropFirst()) : text
+        // SemVer build metadata ("+build.5") never affects precedence.
+        if let plus = cleaned.firstIndex(of: "+") { cleaned = String(cleaned[..<plus]) }
         let coreAndPre = cleaned.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
         let core = coreAndPre.first.map(String.init) ?? ""
         let pre = coreAndPre.count > 1 ? String(coreAndPre[1]) : nil
@@ -92,11 +94,18 @@ public enum PackageVersion: Equatable, Sendable, CustomStringConvertible {
         switch (old, new) {
         case let (.semver(a1, b1, c1, p1, _), .semver(a2, b2, c2, p2, _)):
             if (a1, b1, c1) == (a2, b2, c2) {
-                return p1 == p2 ? .same : .patch
+                switch comparePrerelease(p1, p2) {
+                case 0: return .same
+                case let order where order > 0: return .downgrade   // e.g. 1.0.0 → 1.0.0-beta
+                default: return .patch                              // e.g. 1.0.0-rc.1 → 1.0.0
+                }
             }
             if (a2, b2, c2) < (a1, b1, c1) { return .downgrade }
             if a2 != a1 { return .breaking }
-            if b2 != b1 { return a1 == 0 ? .breaking : .minor }
+            // Below 1.0, SemVer promises nothing: a 0.x minor bump is breaking,
+            // and so is any change at all inside 0.0.x.
+            if a1 == 0 && (b2 != b1 || b1 == 0) { return .breaking }
+            if b2 != b1 { return .minor }
             return .patch
         case (.semver, .revision):
             return .tagToRevision
@@ -106,6 +115,29 @@ public enum PackageVersion: Equatable, Sendable, CustomStringConvertible {
             return s1 == s2 ? .same : .revisionChanged
         default:
             return old == new ? .same : .incomparable
+        }
+    }
+
+    /// SemVer §11 precedence for prerelease tags: `-1` if `lhs` sorts lower,
+    /// `1` if higher, `0` if equal. A release (no tag) outranks any prerelease.
+    static func comparePrerelease(_ lhs: String?, _ rhs: String?) -> Int {
+        switch (lhs, rhs) {
+        case (nil, nil): return 0
+        case (nil, _?): return 1
+        case (_?, nil): return -1
+        case let (l?, r?):
+            let li = l.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+            let ri = r.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+            for (a, b) in zip(li, ri) where a != b {
+                switch (Int(a), Int(b)) {
+                case let (x?, y?): return x < y ? -1 : 1
+                case (_?, nil): return -1          // numeric identifiers sort first
+                case (nil, _?): return 1
+                case (nil, nil): return a < b ? -1 : 1
+                }
+            }
+            if li.count == ri.count { return 0 }
+            return li.count < ri.count ? -1 : 1
         }
     }
 }

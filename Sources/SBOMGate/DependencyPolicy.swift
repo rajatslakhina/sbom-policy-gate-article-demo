@@ -5,7 +5,7 @@ import Foundation
 /// The point is that this is a reviewable file with an owner, not a paragraph
 /// in a style guide: when an agent opens a PR that changes the graph, the gate
 /// reads *this*, and changing what the gate accepts is itself a diff.
-public struct DependencyPolicy: Equatable, Sendable {
+public struct DependencyPolicy: Equatable, Sendable, Codable {
     /// Source prefixes (`host/owner` or `host/owner/repo`) that may be added
     /// without a block. Matched on whole path segments.
     public var trustedSources: [String]
@@ -24,6 +24,28 @@ public struct DependencyPolicy: Equatable, Sendable {
         self.trustedSources = trustedSources
         self.revisionPinAllowList = revisionPinAllowList
         self.blockRevisionPins = blockRevisionPins
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case trustedSources, revisionPinAllowList, blockRevisionPins
+    }
+
+    /// Only `trustedSources` is required, so a minimal policy file is one line.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        trustedSources = try c.decode([String].self, forKey: .trustedSources)
+        revisionPinAllowList = try c.decodeIfPresent(Set<String>.self, forKey: .revisionPinAllowList) ?? []
+        blockRevisionPins = try c.decodeIfPresent(Bool.self, forKey: .blockRevisionPins) ?? false
+    }
+
+    /// Reads a policy from JSON, e.g. a `dependency-policy.json` kept next to
+    /// `Package.swift` so that changing it goes through review like any code.
+    public static func decode(_ json: String) throws -> DependencyPolicy {
+        try JSONDecoder().decode(DependencyPolicy.self, from: Data(json.utf8))
+    }
+
+    public static func load(from url: URL) throws -> DependencyPolicy {
+        try JSONDecoder().decode(DependencyPolicy.self, from: Data(contentsOf: url))
     }
 
     public func trusts(_ source: PackageSource?) -> Bool {
