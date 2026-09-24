@@ -88,6 +88,107 @@ final class ParsingAndRuleTests: XCTestCase {
         }
     }
 
+    func testMissingBaseRootThrows() {
+        var base = SampleSBOMs.base
+        base.metadata?.component = nil
+        XCTAssertThrowsError(try SBOMGate.evaluate(base: base, head: SampleSBOMs.head, policy: .sample)) { error in
+            XCTAssertEqual(error as? SBOMGateError, .missingRoot)
+        }
+    }
+
+    func testDifferentRootsRefuseToDiff() {
+        var base = SampleSBOMs.base
+        base.metadata?.component?.bomRef = "some-other-app"
+        XCTAssertThrowsError(try SBOMGate.evaluate(base: base, head: SampleSBOMs.head, policy: .sample)) { error in
+            XCTAssertEqual(error as? SBOMGateError, .rootMismatch(base: "some-other-app", head: "storefront"))
+        }
+    }
+
+    func testFilteredSBOMsRefuseToDiff() {
+        var productOnly = SampleSBOMs.head
+        productOnly.components.removeAll { $0.swiftEntity == "swift-package" }
+        XCTAssertThrowsError(try SBOMGate.evaluate(base: SampleSBOMs.base, head: productOnly, policy: .sample)) { error in
+            XCTAssertEqual(error as? SBOMGateError, .filteredSBOM(side: "head"))
+        }
+        var packageOnly = SampleSBOMs.base
+        packageOnly.components.removeAll { $0.swiftEntity == "swift-product" }
+        XCTAssertThrowsError(try SBOMGate.evaluate(base: packageOnly, head: SampleSBOMs.head, policy: .sample)) { error in
+            XCTAssertEqual(error as? SBOMGateError, .filteredSBOM(side: "base"))
+        }
+    }
+
+    func testPackageWithNoDependenciesIsValid() throws {
+        let leaf = CycloneDXDocument(
+            specVersion: "1.7",
+            metadata: .init(component: .init(bomRef: "leaf", name: "leaf", version: "1.0.0", purl: nil)),
+            components: [],
+            dependencies: [.init(ref: "leaf", dependsOn: ["leaf:Leaf"])])
+        let report = try SBOMGate.evaluate(base: leaf, head: leaf, policy: .sample)
+        XCTAssertEqual(report.verdict, .pass)
+    }
+
+    func testRootTestProductDoesNotCountAsShipping() throws {
+        // SwiftPM can emit the root's own test product (scope "test"). A helper
+        // reached only from it must not hide a later shipping path.
+        func withTestProduct(_ doc: CycloneDXDocument) -> CycloneDXDocument {
+            var d = doc
+            d.components.append(.init(
+                bomRef: "storefront:StorefrontPackageTests", name: "StorefrontPackageTests",
+                version: "5.12.0", purl: nil, scope: "test",
+                properties: [.init(name: "swift-entity", value: "swift-product")]))
+            d.dependencies.append(.init(ref: "storefront:StorefrontPackageTests",
+                                        dependsOn: ["swift-snapshot-testing:SnapshotTesting"]))
+            return d
+        }
+        let base = withTestProduct(SampleSBOMs.base)
+        XCTAssertEqual(SBOMGraph(base).rootProducts, ["storefront:StorefrontKit"])
+        XCTAssertNil(SBOMGraph(base).shippingPath(to: "swift-snapshot-testing"))
+
+        let report = try SBOMGate.evaluate(base: base, head: withTestProduct(SampleSBOMs.head), policy: .sample)
+        XCTAssertTrue(report.findings.contains { $0.rule == .newlyShipped && $0.package == "swift-snapshot-testing" })
+        XCTAssertEqual(report.findings.count, 8)
+    }
+
+    func testNewlyShippedOnlySaysNoPinChangedWhenTrue() throws {
+        let report = try SBOMGate.evaluate(base: SampleSBOMs.base, head: SampleSBOMs.head, policy: .sample)
+        let snap = try XCTUnwrap(report.findings.first { $0.rule == .newlyShipped })
+        XCTAssertTrue(snap.message.hasSuffix("No pin changed."))
+
+        var head = SampleSBOMs.head
+        guard let i = head.components.firstIndex(where: { $0.bomRef == "swift-snapshot-testing" }) else {
+            return XCTFail("sample must contain swift-snapshot-testing")
+        }
+        head.components[i].version = "1.18.0"
+        head.components[i].purl = "pkg:swift/github.com/pointfreeco/swift-snapshot-testing@1.18.0"
+        let bumped = try SBOMGate.evaluate(base: SampleSBOMs.base, head: head, policy: .sample)
+        let moved = try XCTUnwrap(bumped.findings.first { $0.rule == .newlyShipped })
+        XCTAssertFalse(moved.message.contains("No pin changed"))
+    }
+
+    func testPolicyLoadsFromJSON() throws {
+        let minimal = try DependencyPolicy.decode(#"{"trustedSources": ["github.com/apple"]}"#)
+        XCTAssertEqual(minimal, DependencyPolicy(trustedSources: ["github.com/apple"]))
+
+        let full = try DependencyPolicy.decode("""
+        {"trustedSources": ["github.com/apple"], "revisionPinAllowList": ["internal-kit"], "blockRevisionPins": true}
+        """)
+        XCTAssertEqual(full.revisionPinAllowList, ["internal-kit"])
+        XCTAssertTrue(full.blockRevisionPins)
+        XCTAssertThrowsError(try DependencyPolicy.decode(#"{"blockRevisionPins": true}"#), "trustedSources is required")
+    }
+
+    func testMissingSourceOnOneSideIsReviewed() throws {
+        var head = SampleSBOMs.base
+        guard let i = head.components.firstIndex(where: { $0.bomRef == "swift-log" }) else {
+            return XCTFail("sample must contain swift-log")
+        }
+        head.components[i].purl = nil
+        head.components[i].pedigree = nil
+        let report = try SBOMGate.evaluate(base: SampleSBOMs.base, head: head, policy: .sample)
+        XCTAssertEqual(report.findings.map(\.rule), [.sourceUnknown])
+        XCTAssertEqual(report.verdict, .needsReview)
+    }
+
     func testToolDriftIsReviewed() throws {
         var head = SampleSBOMs.base
         head.metadata?.tools?.components?[0].version = "6.4.1"
@@ -150,6 +251,20 @@ final class ParsingAndRuleTests: XCTestCase {
         XCTAssertEqual(c("1.6.1", String(repeating: "a", count: 40)), .tagToRevision)
         XCTAssertEqual(c(String(repeating: "a", count: 40), String(repeating: "b", count: 40)), .revisionChanged)
         XCTAssertEqual(c("main", "develop"), .incomparable)
+    }
+
+    func testPrereleasePrecedence() {
+        func c(_ a: String, _ b: String) -> PackageVersion.Change {
+            PackageVersion.change(from: PackageVersion(a), to: PackageVersion(b))
+        }
+        XCTAssertEqual(c("1.0.0", "1.0.0-beta"), .downgrade, "a release outranks its prerelease")
+        XCTAssertEqual(c("1.0.0-rc.2", "1.0.0-alpha"), .downgrade)
+        XCTAssertEqual(c("1.0.0-alpha.2", "1.0.0-alpha.10"), .patch, "numeric identifiers compare numerically")
+        XCTAssertEqual(c("1.0.0-rc.1", "1.0.0"), .patch)
+        XCTAssertEqual(c("1.0.0-beta", "1.0.0-beta"), .same)
+        XCTAssertEqual(c("1.2.3+build.1", "1.2.3+build.9"), .same, "build metadata is ignored")
+        XCTAssertEqual(c("0.0.3", "0.0.4"), .breaking, "0.0.x promises nothing")
+        XCTAssertEqual(c("0.3.1", "0.3.2"), .patch)
     }
 
     // MARK: Sources
